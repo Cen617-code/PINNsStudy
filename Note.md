@@ -34,3 +34,28 @@
   `输入 x → 网络 T → dT/dx → d²T/dx²`
 
 - **计算图连续性验证**：输出张量中出现 `grad_fn=<SliceBackward0>` 即证明计算图未断裂，导数值仍然可以参与后续反向传播。
+
+## Phase 2: 求解 1D 热传导方程
+**日期**: 2026.2.27
+
+### 4. 配置点采样 (Collocation Points)
+- **内部点**：用 `torch.rand` 在有界域 `[0,1]×[0,1]` 中均匀随机采样，需 `requires_grad=True`（因为要用 autograd 算 PDE 残差）。
+- **IC/BC 点**：独立采样，**不需要** `requires_grad=True`。因为 IC/BC Loss 只是数据拟合损失（网络输出 vs 已知值），梯度直接流向网络权重，不需要对输入坐标求导。
+- **验证网格**：用 `torch.linspace` 生成等间距网格，保证可视化和误差计算的均匀覆盖。
+
+### 5. PDE 残差计算 — "残差即损失"
+- 热传导方程残差：`residual = dT/dt - α * d²T/dx²`，应趋近于 0。
+- **所有** `autograd.grad` 调用都必须 `create_graph=True`，即使只需一阶导数（如 `dT/dt`），因为最终 `loss.backward()` 需要穿过这些计算图回溯到网络权重。
+- 残差函数应定义为**独立函数**（而非网络类的方法），体现关注点分离。
+
+### 6. 三项 Loss 联合训练
+- `loss_pde = MSE(residual, 0)` — 物理约束
+- `loss_ic = MSE(T_pred(x,0), sin(πx))` — 初始条件
+- `loss_bc = MSE(T_pred(0,t), 0) + MSE(T_pred(1,t), 0)` — 边界条件
+- `loss_total = loss_pde + loss_ic + loss_bc`
+- **API 注意**：`nn.MSELoss` 是类（需先实例化再调用），`F.mse_loss` 是函数式接口（直接调用更简洁）。
+
+### 7. 训练结果与验证
+- 网络结构：`[2] → [50, Tanh] → [1]`，Adam 优化器 `lr=1e-3`，训练 5000 轮。
+- **最终相对 L2 误差：1.14e-03（约 0.1%）**，与解析解 `T(x,t) = sin(πx)·exp(-απ²t)` 高度吻合。
+- 调参经验：增加训练轮数（1000→5000）和隐藏神经元数（20→50）对收敛效果提升显著。
