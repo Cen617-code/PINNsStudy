@@ -156,7 +156,7 @@ print("训练完成！")
 
 
 # ===================== 验证与可视化 =====================
-alpha_value = np.linspace(alpha_min, alpha_max, 8)
+alpha_values = np.linspace(alpha_min, alpha_max, 8)
 errors = []
 
 x_eval = torch.linspace(0, 1, 100)
@@ -165,22 +165,34 @@ X, T_grid = torch.meshgrid(x_eval, t_eval, indexing='ij')
 
 X_flat = X.flatten().unsqueeze(1)
 T_flat = T_grid.flatten().unsqueeze(1)
-XT_eval = torch.cat([X_flat, T_flat, alpha_eval], dim=1)
 
 model.eval()
 for alpha_val in alpha_values:
+    alpha_flat = torch.full_like(X_flat, alpha_val)
 
+    XTA_eval = torch.cat([X_flat, T_flat, alpha_flat], dim=1)
 
-with torch.no_grad():
-    T_pred_flat = model(XT_eval)
+    with torch.no_grad():
+        T_pred_flat = model(XTA_eval)
 
-T_pred = T_pred_flat.reshape(100, 100).numpy()
+    T_pred = T_pred_flat.reshape(100, 100).numpy()
+    X_np = X.numpy()
+    T_np = T_grid.numpy()
 
-X_np = X.numpy()
-T_np = T_grid.numpy()
+    # 解析解: T(x,t) = sin(πx) · exp(-α·π²·t)
+    T_exact = np.sin(np.pi * X_np) * np.exp(-alpha_val * (np.pi**2) * T_np)
+    error_l2 = np.linalg.norm(T_pred - T_exact, 2) / np.linalg.norm(T_exact, 2)
+    errors.append(error_l2)
 
-# 解析解: T(x,t) = sin(πx) · exp(-α·π²·t)
-T_exact = np.sin(np.pi * X_np) * np.exp(-alpha_val * (np.pi**2) * T_np)
-error_l2 = np.linalg.norm(T_pred - T_exact, 2) / np.linalg.norm(T_exact, 2)
-print(f"相对 L2 误差 (Relative L2 Error): {error_l2:.4e}")
+    print(f"α = {alpha_val:.4f} | 相对 L2 误差 = {error_l2:.4e}")
 
+plt.figure(figsize=(8,5))
+plt.plot(alpha_values, errors, marker='o', linestyle='-', color='#1f77b4', linewidth=2, markersize=8)
+plt.xlabel(r'Thermal Diffusivity ($\alpha$)', fontsize=12)
+plt.ylabel('Relative L2 Error', fontsize=12)
+plt.title('PINN Generalization over Multiple $\\alpha$ Values', fontsize=14)
+plt.yscale('log')
+plt.grid(True, which="both", ls="--", alpha=0.6)
+plt.tight_layout()
+plt.savefig('multi_alpha_error.png', dpi=150, bbox_inches='tight')
+print("多 α 验证图已保存为 'multi_alpha_error.png'")
