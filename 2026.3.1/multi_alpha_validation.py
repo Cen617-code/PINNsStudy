@@ -1,6 +1,6 @@
 """
-参数化 PINN (Parametric Physics-Informed Neural Network)
-========================================================
+参数化 PINN (Parametric Physics-Informed Neural Network) — 动态重采样版
+====================================================================
 目标: 求解参数化 1D 热传导方程 dT/dt = α · d²T/dx²
       其中 α (热扩散系数) 作为网络输入维度, 使同一个网络能预测不同 α 下的温度场。
       这是从"求解器"到"代理模型 (Surrogate Model)"的核心跃迁。
@@ -10,7 +10,13 @@
 边界条件 (BC): T(0, t) = 0, T(1, t) = 0
 解析解: T(x,t) = sin(πx) · exp(-α·π²·t)
 
-Phase 3 学习代码 — 2026.2.28
+关键改动 (2026.3.4):
+  - PDE/IC/BC 配置点在每轮训练中重新采样 (动态重采样),
+    使网络在 10000 轮训练中累计"见过"约 1000万个不同域内位置的物理约束。
+  - 观测数据点保持固定 (模拟真实实验中不可重复的测量数据)。
+  - 计算图安全性: loss.backward() 默认销毁计算图, 新张量每轮构建新图, 无副作用。
+
+Phase 3 学习代码 — 2026.2.28 ~ 2026.3.4
 """
 
 import torch
@@ -30,39 +36,19 @@ alpha_max = 0.1         # α 采样上界
 alpha_test = 0.05       # 验证时使用的固定 α 值
 epochs = 10000          # 训练轮数
 learning_rate = 1e-3    # Adam 学习率
-w_data = 1
+w_data = 1              # 数据损失权重 (L_data 的系数)
 
-# ===================== 采样配置点 =====================
-# 内部点: 需要 requires_grad=True (x, t), 因为 PDE 残差需要对它们求导
-# α 不需要 requires_grad, 它只是系数, 不是被微分的自变量
-x = torch.rand(N_f, 1, requires_grad=True)
-t = torch.rand(N_f, 1, requires_grad=True)
-alpha_sample = alpha_min + (alpha_max - alpha_min) * torch.rand(N_f, 1)
-
-# 初始条件: t=0, x 随机, α 随机
-x_ic = torch.rand(N_ic, 1)
-t_ic = torch.zeros(N_ic, 1)
-alpha_ic = alpha_min + (alpha_max - alpha_min) * torch.rand(N_ic, 1)
-
-# 左边界: x=0, t 随机, α 随机
-x_b = torch.zeros(N_bc, 1)
-t_b = torch.rand(N_bc, 1)
-alpha_b = alpha_min + (alpha_max - alpha_min) * torch.rand(N_bc, 1)
-
-# 右边界: x=1, t 随机, α 随机
-x_c = torch.ones(N_bc, 1)
-t_c = torch.rand(N_bc, 1)
-alpha_c = alpha_min + (alpha_max - alpha_min) * torch.rand(N_bc, 1)
-
-# ===================== 观测数据采样 =====================
-N_data = 200        #域内观测点数量（远少于配置点 N_f=1000）
+# ===================== 观测数据采样 (固定, 不参与重采样) =====================
+# 观测数据代表"实验室已测好的固定测量值", 物理上不可能每轮换一批实验结果,
+# 因此在训练循环外一次性采样, 始终保持不变。
+N_data = 200        # 域内观测点数量（远少于配置点 N_f=1000）
 
 x_data = torch.rand(N_data, 1)
 t_data = torch.rand(N_data, 1)
 alpha_data = alpha_min + (alpha_max - alpha_min) * torch.rand(N_data, 1)
 
-# "观测值" — 由解析解生成（模拟 COMSOL 或实验数据）
-T_data_target =   torch.sin(math.pi * x_data) * torch.exp(-alpha_data * (math.pi**2) * t_data)
+# "观测值" — 由解析解生成（模拟 COMSOL 仿真或实验数据）
+T_data_target = torch.sin(math.pi * x_data) * torch.exp(-alpha_data * (math.pi**2) * t_data)
 
 # ===================== 网络定义 =====================
 class SimpleMLP(nn.Module):
@@ -136,6 +122,32 @@ scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.5)
 
 print("开始训练...")
 for epoch in range(epochs):
+    # ===================== 动态重采样配置点 =====================
+    # 每轮重新采样: 使网络累计见过 epochs × N_f 个不同域内位置的物理约束,
+    # 等效于蒙特卡洛方式极大扩展域覆盖范围。
+    # 计算图安全: loss.backward() 自动销毁上一轮的图, 新张量构建全新的图。
+    #
+    # 内部点: x, t 需要 requires_grad=True (PDE 残差需要 autograd.grad 对它们求导)
+    # α 不需要 requires_grad, 它只是 PDE 中的系数, 不是被微分的自变量
+    x = torch.rand(N_f, 1, requires_grad=True)
+    t = torch.rand(N_f, 1, requires_grad=True)
+    alpha_sample = alpha_min + (alpha_max - alpha_min) * torch.rand(N_f, 1)
+
+    # 初始条件: t=0, x 随机, α 随机 (每轮重新采样)
+    x_ic = torch.rand(N_ic, 1)
+    t_ic = torch.zeros(N_ic, 1)
+    alpha_ic = alpha_min + (alpha_max - alpha_min) * torch.rand(N_ic, 1)
+
+    # 左边界: x=0, t 随机, α 随机 (每轮重新采样)
+    x_b = torch.zeros(N_bc, 1)
+    t_b = torch.rand(N_bc, 1)
+    alpha_b = alpha_min + (alpha_max - alpha_min) * torch.rand(N_bc, 1)
+
+    # 右边界: x=1, t 随机, α 随机 (每轮重新采样)
+    x_c = torch.ones(N_bc, 1)
+    t_c = torch.rand(N_bc, 1)
+    alpha_c = alpha_min + (alpha_max - alpha_min) * torch.rand(N_bc, 1)
+
     optimizer.zero_grad()
 
     # PDE 损失: 域内物理方程残差 → 0
