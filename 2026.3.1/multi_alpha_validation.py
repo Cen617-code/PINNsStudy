@@ -30,6 +30,7 @@ alpha_max = 0.1         # α 采样上界
 alpha_test = 0.05       # 验证时使用的固定 α 值
 epochs = 10000          # 训练轮数
 learning_rate = 1e-3    # Adam 学习率
+w_data = 1
 
 # ===================== 采样配置点 =====================
 # 内部点: 需要 requires_grad=True (x, t), 因为 PDE 残差需要对它们求导
@@ -53,6 +54,15 @@ x_c = torch.ones(N_bc, 1)
 t_c = torch.rand(N_bc, 1)
 alpha_c = alpha_min + (alpha_max - alpha_min) * torch.rand(N_bc, 1)
 
+# ===================== 观测数据采样 =====================
+N_data = 200        #域内观测点数量（远少于配置点 N_f=1000）
+
+x_data = torch.rand(N_data, 1)
+t_data = torch.rand(N_data, 1)
+alpha_data = alpha_min + (alpha_max - alpha_min) * torch.rand(N_data, 1)
+
+# "观测值" — 由解析解生成（模拟 COMSOL 或实验数据）
+T_data_target =   torch.sin(math.pi * x_data) * torch.exp(-alpha_data * (math.pi**2) * t_data)
 
 # ===================== 网络定义 =====================
 class SimpleMLP(nn.Module):
@@ -137,6 +147,11 @@ for epoch in range(epochs):
         model(torch.cat([x_ic, t_ic, alpha_ic], dim=1)),
         torch.sin(x_ic * math.pi))
 
+    # 数据损失：网络预测 vs "观测值"
+    loss_data = F.mse_loss(
+        model(torch.cat([x_data, t_data, alpha_data,], dim=1)),
+        T_data_target)
+    
     # BC 损失: T(0, t, α) = 0, T(1, t, α) = 0
     T_left = model(torch.cat([x_b, t_b, alpha_b], dim=1))
     T_right = model(torch.cat([x_c, t_c, alpha_c], dim=1))
@@ -144,14 +159,14 @@ for epoch in range(epochs):
                + F.mse_loss(T_right, torch.zeros_like(T_right)))
 
     # 等权联合训练
-    loss_total = loss_pde + loss_ic + loss_bc
+    loss_total = loss_pde + loss_ic + loss_bc + w_data * loss_data
 
     loss_total.backward()
     optimizer.step()
 
     if (epoch + 1) % 100 == 0:
         print(f"Epoch [{epoch+1}/{epochs}], Loss Total: {loss_total.item():.6f} "
-              f"(PDE: {loss_pde.item():.6f}, IC: {loss_ic.item():.6f}, BC: {loss_bc.item():.6f})")
+              f"(PDE: {loss_pde.item():.6f}, IC: {loss_ic.item():.6f}, BC: {loss_bc.item():.6f}), Data: {loss_data.item():.6f}")
 print("训练完成！")
 
 
