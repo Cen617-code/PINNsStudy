@@ -174,3 +174,60 @@
 - Phase 3 的核心目标——将网络从"求解器"升级为"代理模型"——已完成。
 - 掌握的关键技术：参数化输入（α 作为网络维度）、多参数泛化验证、数据损失引入与权重调参、动态重采样。
 - 下一步：进入 Phase 4，学习工业级框架 DeepXDE。
+
+### 15. GPU 加速版代码迁移笔记
+**日期**: 2026.3.5
+**文件**: `2026.3.1/multi_alpha_validation_GPU.py`
+
+- **目的**：为后续超算（H100 GPU）部署做准备，将 CPU 版代码迁移至 GPU，核心物理逻辑与训练流程完全不变。
+
+#### 15.1 PyTorch 设备迁移的 4 个要点
+
+1. **设备检测**：`device = torch.device("cuda" if torch.cuda.is_available() else "cpu")`，本地无 GPU 时自动回退 CPU，代码无需修改即可在两种环境运行。
+2. **数据直接生成在 GPU 显存**：所有 `torch.rand()` / `torch.zeros()` / `torch.ones()` 调用加 `device=device` 参数，避免 CPU→GPU 拷贝的带宽开销。
+3. **模型搬运**：`SimpleMLP().to(device)` 将网络所有参数（权重矩阵、偏置向量）一次性搬入 GPU 显存。
+4. **结果提取回 CPU**：GPU 张量不能直接 `.numpy()`，必须先 `.cpu()` 拉回主内存再转换：`T_pred_flat.cpu().reshape(100, 100).numpy()`。
+
+#### 15.2 工程注意事项
+- **张量设备一致性**：同一次运算中的所有张量必须在同一设备上，否则 `RuntimeError: Expected all tensors to be on the same device`。
+- **验证数据迁移**：验证阶段用 `torch.linspace` 默认生成在 CPU 上，需 `.to(device)` 送入 GPU 后才能喂给模型。
+
+## Phase 4: 引入工业级框架 DeepXDE
+**日期**: 2026.3.5
+
+Phase 4 的核心目标是掌握 DeepXDE 工业级框架，摒弃底层手写，学会使用"声明式"物理建模范式。
+
+### 16. DeepXDE 的声明式架构映射
+相比 Phase 3 中的纯手写代码，DeepXDE 将所有操作高度封装：
+
+| 功能模块 | 原 PyTorch 手写代码 | DeepXDE API |
+|---|---|---|
+| **坐标采样** | `torch.rand(N_f)` 且 `requires_grad=True` | 用 `geom = dde.geometry.Interval` 和 `dde.geometry.TimeDomain` 声明空间和时间域 |
+| **一阶导数** | `autograd.grad` 三行长代码 | `dde.grad.jacobian(y, x, i=0, j=时间列索引)` |
+| **二阶导数** | 两层嵌套 `autograd.grad` | `dde.grad.hessian(y, x, i=0, j=空间列索引)` |
+| **边界判定** | 手动截取 `x=0` 和 `x=1` 代入 | `dde.icbc.DirichletBC` (借助 `on_boundary` 回调逻辑) |
+| **总损失组装** | `loss_total = loss_pde + ... + w_data * loss_data` | `dde.data.TimePDE(geomtime, pde, [bc, ic])` |
+| **模型本体** | 逐层 `nn.Linear` 搭建 `SimpleMLP` | `dde.nn.FNN([2] + [50]*3 + [1], "tanh")` |
+
+### 17. 进阶利器：回调系统与双阶段优化
+DeepXDE 的设计哲学之一：保持主干纯净，用附加插件（Callbacks）与优化器接驳（Compile）解决复杂需求。
+
+#### 17.1 `PDEPointResampler` (动态重采样)
+- **手写痛点**：要实现每轮新采样，必须把采样的长代码塞进 `for epoch:` 循环内部，导致主逻辑臃肿。
+- **框架解法**：只需要声明 `pde_resampler = dde.callbacks.PDEPointResampler(period=100)`，然后加入 `model.train(callbacks=[pde_resampler])`。它会每隔 100 轮接管控制流，在设定的 `geomtime` 内产生新坐标完成蒙特卡洛扩展。
+
+#### 17.2 L-BFGS 二阶拟牛顿法优化
+- **现象**：在复杂或参数化的 PDE 里，Adam 会在最优解谷底平缓处震荡，Loss 卡在 1e-4 量级下不去。
+- **L-BFGS 原理**：它是基于海森矩阵（曲率信息）的二阶算法，能够直接看到山谷的三维地形并一步跨到最低点。
+- **最佳实践**：先用 `adam`（一阶，带惯性）跑上万步，把模型带到整体最优“火山口”；接着重新编译 `model.compile("L-BFGS")`，再调 `train()`，它会利用线搜索疯狂逼近，常常能轻易把精度干爆到 1e-6 甚至更低。
+
+### 18. 从 1D 到 2D+T：参数化几何构建降维打击
+在构建参数化代理模型（即 α 从常量变维模型输入变量）时：
+- **手写时代**：生搬硬凑地把常量 α 拓展为张量维度：`torch.cat([x, t, alpha], dim=1)`
+- **框架视角**：**参数空间本身也可以看作几何空间！**
+  - 不再是 `Interval(0, 1) + TimeDomain(0, 1)`（输入维度 2）
+  - 而是把它升格为二维矩形：`dde.geometry.Rectangle([x_min, α_min], [x_max, α_max]) + TimeDomain(0, 1)`。
+  - 输入维度变为 `[3]`：第 0 列代表物理位置 $x$，第 1 列代表物理参数 $\alpha$，第 2 列始终固定代表时间 $t$。
+- **残差取参**：在自定义 `pde(x, y)` 函数里面，只需通过 `alpha_val = x[:, 1:2]` 切片实时拿到当前的 α 进行公式计算即可。而且依然可以直接复用所有的 `DirichletBC` 和重采样回调，体验极其丝滑。
+
+在跑通这个流程后，针对多 α 泛化的测试同样证实了 L-BFGS 的碾压级实力，我们的参数化 PINNs 现在已经有了一个最稳固的代码模板，为将来进军多参数重型仿真打下了坚实基础。
